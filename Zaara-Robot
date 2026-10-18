@@ -1,0 +1,486 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "BluetoothSerial.h"
+#include <ESP32Servo.h>
+#include <DFRobotDFPlayerMini.h>
+
+// =====================================
+// ZAARA ESP32 WELCOME ROBOT
+// =====================================
+
+// L298N
+const int IN1 = 26;
+const int IN2 = 27;
+const int ENA = 25;
+const int IN3 = 18;
+const int IN4 = 19;
+const int ENB = 23;
+
+// HC-SR04
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 34;
+
+// Servo
+const int SERVO_PIN = 13;
+Servo scanner;
+
+// MP3-TF-16P V3.0
+HardwareSerial MP3Serial(2);
+DFRobotDFPlayerMini player;
+bool mp3Ready = false;
+
+// Bluetooth Classic SPP
+BluetoothSerial SerialBT;
+bool bluetoothReady = false;
+
+// Wi-Fi
+const char* wifiName = "ZAARA_Robot";
+const char* wifiPassword = "Welcome123";
+WebServer server(80);
+
+// Settings
+const int STOP_DISTANCE = 40;
+const int RESUME_DISTANCE = 60;
+const int MANUAL_SAFE_DISTANCE = 20;
+
+// Robot state
+bool autoMode = true;
+bool welcomePlayed = false;
+bool robotStopped = true;
+float lastDistance = -1;
+String lastAction = "Starting";
+
+// =====================================
+// MOTOR CONTROL
+// =====================================
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  digitalWrite(ENA, LOW);
+  digitalWrite(ENB, LOW);
+
+  robotStopped = true;
+}
+
+void forwardMotors() {
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  robotStopped = false;
+}
+
+void reverseMotors() {
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  robotStopped = false;
+}
+
+void turnLeft() {
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  robotStopped = false;
+}
+
+void turnRight() {
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  robotStopped = false;
+}
+
+// =====================================
+// ULTRASONIC SENSOR
+// =====================================
+
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+      pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+// =====================================
+// MP3 WELCOME MESSAGE
+// SD card: /MP3/0001.mp3
+// =====================================
+
+void playWelcome() {
+  if (mp3Ready) {
+    player.playMp3Folder(1);
+    lastAction = "Welcome audio requested";
+    Serial.println("[AUDIO] Playing 0001.mp3");
+  } else {
+    Serial.println("[AUDIO] MP3 is not ready");
+    lastAction = "MP3 unavailable";
+  }
+}
+
+// =====================================
+// COMMAND HANDLER
+// =====================================
+
+void handleCommand(char command) {
+  if (command >= 'a' && command <= 'z') {
+    command -= 32;
+  }
+
+  Serial.print("[COMMAND] ");
+  Serial.println(command);
+
+  switch (command) {
+    case 'A':
+      autoMode = true;
+      welcomePlayed = false;
+      lastAction = "Automatic mode";
+      Serial.println("[MODE] AUTO");
+      break;
+
+    case 'M':
+      autoMode = false;
+      stopMotors();
+      lastAction = "Manual mode";
+      Serial.println("[MODE] MANUAL");
+      break;
+
+    case 'F':
+      autoMode = false;
+
+      if (lastDistance > 0 &&
+          lastDistance <= MANUAL_SAFE_DISTANCE) {
+        stopMotors();
+        lastAction = "Forward blocked: obstacle";
+        Serial.println("[SAFETY] Object too close");
+      } else if (lastDistance < 0) {
+        stopMotors();
+        lastAction = "Forward blocked: no sensor echo";
+        Serial.println("[SAFETY] Sensor reading unavailable");
+      } else {
+        forwardMotors();
+        lastAction = "Forward";
+        Serial.println("[MOTOR] FORWARD");
+      }
+      break;
+
+    case 'B':
+      autoMode = false;
+      reverseMotors();
+      lastAction = "Reverse";
+      Serial.println("[MOTOR] REVERSE");
+      break;
+
+    case 'L':
+      autoMode = false;
+      turnLeft();
+      lastAction = "Left";
+      Serial.println("[MOTOR] LEFT");
+      break;
+
+    case 'R':
+      autoMode = false;
+      turnRight();
+      lastAction = "Right";
+      Serial.println("[MOTOR] RIGHT");
+      break;
+
+    case 'S':
+      autoMode = false;
+      stopMotors();
+      lastAction = "Stopped";
+      Serial.println("[MOTOR] STOP");
+      break;
+
+    case 'W':
+      playWelcome();
+      break;
+
+    default:
+      Serial.println(
+        "[HELP] Commands: A M F B L R S W"
+      );
+      break;
+  }
+}
+
+// =====================================
+// WI-FI CONTROL PAGE
+// =====================================
+
+const char webpage[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZAARA Robot</title>
+<style>
+body {
+  background:#101827;color:white;text-align:center;
+  font-family:Arial;margin:20px
+}
+button {
+  width:95px;height:52px;margin:5px;
+  border:0;border-radius:9px;font-weight:bold
+}
+.move {background:#22c55e}
+.stop {background:#ef4444;color:white}
+.mode {background:#38bdf8}
+.audio {background:#facc15}
+#status {padding:12px;background:#263449;border-radius:9px}
+</style>
+</head>
+<body>
+<h1>ZAARA ROBOT</h1>
+<div id="status">Connecting...</div>
+<h3>Movement</h3>
+<div><button class="move" onclick="cmd('F')">FORWARD</button></div>
+<div>
+<button class="move" onclick="cmd('L')">LEFT</button>
+<button class="stop" onclick="cmd('S')">STOP</button>
+<button class="move" onclick="cmd('R')">RIGHT</button>
+</div>
+<div><button class="move" onclick="cmd('B')">REVERSE</button></div>
+<h3>Mode and Audio</h3>
+<button class="mode" onclick="cmd('A')">AUTO</button>
+<button class="mode" onclick="cmd('M')">MANUAL</button>
+<button class="audio" onclick="cmd('W')">WELCOME</button>
+<script>
+function cmd(c) {
+ fetch('/cmd?c='+c).then(r=>r.text())
+ .then(t=>document.getElementById('status').innerText=t)
+ .catch(()=>{});
+}
+setInterval(()=>{
+ fetch('/status').then(r=>r.text())
+ .then(t=>document.getElementById('status').innerText=t)
+ .catch(()=>{});
+},1000);
+</script>
+</body>
+</html>
+)HTML";
+
+void setupWiFi() {
+  WiFi.mode(WIFI_AP);
+
+  if (WiFi.softAP(wifiName, wifiPassword)) {
+    Serial.println("[WIFI] Access point started");
+    Serial.print("[WIFI] Network: ");
+    Serial.println(wifiName);
+    Serial.print("[WIFI] Open http://");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("[WIFI] Access point failed");
+  }
+
+  server.on("/", []() {
+    server.send_P(200, "text/html", webpage);
+  });
+
+  server.on("/cmd", []() {
+    if (server.hasArg("c") && server.arg("c").length()) {
+      handleCommand(server.arg("c")[0]);
+    }
+    server.send(200, "text/plain",
+                "Action: " + lastAction);
+  });
+
+  server.on("/status", []() {
+    String s = "Mode: ";
+    s += autoMode ? "AUTO" : "MANUAL";
+    s += " | Distance: ";
+
+    if (lastDistance < 0) {
+      s += "No echo";
+    } else {
+      s += String(lastDistance, 1) + " cm";
+    }
+
+    s += " | Action: " + lastAction;
+    server.send(200, "text/plain", s);
+  });
+
+  server.begin();
+  Serial.println("[WIFI] Web server ready");
+}
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1200);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("     ZAARA WELCOME ROBOT");
+  Serial.println("================================");
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  scanner.setPeriodHertz(50);
+  scanner.attach(SERVO_PIN, 500, 2400);
+  scanner.write(90);
+
+  Serial.println("[SENSOR] Ultrasonic initialized");
+
+  // MP3 startup
+  MP3Serial.begin(9600, SERIAL_8N1, 16, 17);
+  delay(500);
+
+  Serial.println("[AUDIO] Checking MP3 module...");
+
+  if (player.begin(MP3Serial)) {
+    mp3Ready = true;
+    player.volume(25);
+    Serial.println("[AUDIO] MP3 ready");
+  } else {
+    Serial.println("[AUDIO] MP3 not detected");
+  }
+
+  // Bluetooth startup with diagnostics
+  Serial.println("[BT] Starting Bluetooth Classic...");
+
+  if (SerialBT.begin("ZAARA")) {
+    bluetoothReady = true;
+    Serial.println("[BT] STARTED SUCCESSFULLY");
+    Serial.println("[BT] Device name: ZAARA");
+    Serial.println("[BT] Pair from Android Bluetooth settings");
+    Serial.println("[BT] Then connect using a serial terminal app");
+  } else {
+    bluetoothReady = false;
+    Serial.println("[BT] START FAILED");
+    Serial.println("[BT] Check board compatibility");
+  }
+
+  setupWiFi();
+
+  Serial.println("--------------------------------");
+  Serial.println("[READY] Robot initialization complete");
+  Serial.println("[SERIAL] Send A/M/F/B/L/R/S/W");
+  Serial.println("[WIFI] Phone network: ZAARA_Robot");
+  Serial.println("[WIFI] Address: http://192.168.4.1");
+  Serial.println("================================");
+
+  autoMode = true;
+}
+
+// =====================================
+// MAIN LOOP
+// =====================================
+
+void loop() {
+  server.handleClient();
+
+  // Commands typed in Serial Monitor
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') {
+      handleCommand(c);
+    }
+  }
+
+  // Commands received over Bluetooth
+  while (bluetoothReady && SerialBT.available()) {
+    char c = SerialBT.read();
+
+    if (c != '\n' && c != '\r' && c != '\t') {
+      Serial.print("[BT RX] Received: ");
+      Serial.println(c);
+
+      handleCommand(c);
+
+      SerialBT.print("ZAARA action: ");
+      SerialBT.println(lastAction);
+    }
+  }
+
+  // Read distance regularly
+  lastDistance = getDistance();
+
+  Serial.print("[SENSOR] Distance: ");
+  if (lastDistance < 0) {
+    Serial.print("NO ECHO");
+  } else {
+    Serial.print(lastDistance, 1);
+    Serial.print(" cm");
+  }
+
+  Serial.print(" | Mode: ");
+  Serial.print(autoMode ? "AUTO" : "MANUAL");
+
+  if (autoMode) {
+    // Fail safe: no echo means stop
+    if (lastDistance < 0) {
+      stopMotors();
+      lastAction = "Stopped: sensor no echo";
+      Serial.println(" | ACTION: STOP - NO ECHO");
+    }
+    else if (lastDistance <= STOP_DISTANCE) {
+      stopMotors();
+      lastAction = "Object detected - STOP";
+      Serial.println(" | ACTION: STOP - OBJECT");
+
+      if (!welcomePlayed) {
+        playWelcome();
+        welcomePlayed = true;
+      }
+    }
+    else if (lastDistance >= RESUME_DISTANCE) {
+      welcomePlayed = false;
+      forwardMotors();
+      lastAction = "Path clear - FORWARD";
+      Serial.println(" | ACTION: FORWARD");
+    }
+    else {
+      Serial.print(" | ACTION: ");
+      Serial.println(robotStopped ? "WAITING" : "CONTINUE");
+    }
+  } else {
+    Serial.print(" | ACTION: ");
+    Serial.println(lastAction);
+  }
+
+  delay(300);
+}
